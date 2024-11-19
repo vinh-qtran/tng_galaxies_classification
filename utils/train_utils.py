@@ -10,7 +10,7 @@ import pickle
 
 from tqdm import tqdm
 
-class Train:
+class SupervisedTraining:
     def __init__(
             self,
             model : nn.Module,
@@ -25,7 +25,7 @@ class Train:
             device='mps',
     ): 
         """
-        Initializes the Train class with required parameters.
+        Initializes the SupervisedTraining class for supervised learning tasks.
 
         Args:
             model (torch.nn.Module): The model to be trained.
