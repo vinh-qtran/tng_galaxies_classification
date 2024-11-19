@@ -1,1 +1,1 @@
-# tng_galaxies_classification
+# TNG Galaxies Classification
