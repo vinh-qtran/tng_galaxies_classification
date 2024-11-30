@@ -29,6 +29,7 @@ class SupervisedTraining:
             optimizer=optim.Adam,
             scheduler=None,
             is_classification=True,
+            num_classes=None,
             device='mps',
     ): 
         self.device = device
@@ -45,6 +46,9 @@ class SupervisedTraining:
         self.valloader = valloader
 
         self.is_classification = is_classification
+        if self.is_classification:
+            assert num_classes is not None, 'num_classes must be specified for classification tasks'
+            self.accuracy = Accuracy(task="multiclass", num_classes=num_classes).to(self.device)
 
     def get_accuracy(self, outputs, targets):     
         """
@@ -52,7 +56,7 @@ class SupervisedTraining:
         """
 
         preds = torch.argmax(outputs, dim=1)
-        return Accuracy(preds, targets)
+        return self.accuracy(preds, targets).item()
 
     def train_epoch(self):
         """
