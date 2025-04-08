@@ -1,51 +1,34 @@
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
 import numpy as np
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 
-class DNN(nn.Module):
+class BaseMLP(nn.Module):
     def __init__(self,
                  input_dim : int,
                  hidden_dims : list,
-                 output_dim : int,
+                 output_dim : int = 1,
                  dropout = 0.0,
                  activation = nn.ReLU(),
-                 norm = nn.LayerNorm,
-                 is_classification=False,):
-        super(DNN, self).__init__()
-
-        self.input_dim = input_dim
-        self.hidden_dims = hidden_dims
-        self.output_dim = output_dim
-
-        self.dropout = dropout
-
-        self.activation = activation
-        self.norm = norm
-        self.is_classification = is_classification
+                 norm = nn.BatchNorm1d,
+                 last_activation = nn.Sigmoid()):
+        super(BaseMLP, self).__init__()
         
-        self.layers = []
-        for i in range(len(hidden_dims)):
-            self.layers.append(nn.Dropout(p=self.dropout))
-            if i == 0:
-                self.layers.append(self.norm(input_dim))
-                self.layers.append(nn.Linear(input_dim, hidden_dims[i]))
-            else:
-                self.layers.append(self.norm(hidden_dims[i-1]))
-                self.layers.append(nn.Linear(hidden_dims[i-1], hidden_dims[i]))
-            self.layers.append(self.activation)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
 
-        self.layers.append(self.norm(hidden_dims[-1]))
-        self.layers.append(nn.Linear(hidden_dims[-1], output_dim))
+        layer_dims = [input_dim] + hidden_dims + [output_dim]
+        for i in range(len(layer_dims)-1):
+            self.norms.append(norm(layer_dims[i]))
 
-        self.last_activation = nn.Softmax(dim=1) if is_classification else nn.Identity()
-
-        self.layers = nn.Sequential(*self.layers)
+            self.layers.append(nn.Sequential(
+                nn.Dropout(p=dropout),
+                nn.Linear(layer_dims[i], layer_dims[i+1]),
+                activation if i != len(layer_dims)-2 else last_activation,
+            ))
 
     def forward(self, x):
-        return self.last_activation(self.layers(x))
+        for norm, layer in zip(self.norms, self.layers):
+            x = norm(x.view(-1, x.shape[-1])).view(x.shape)
+            x = layer(x)
+        return x

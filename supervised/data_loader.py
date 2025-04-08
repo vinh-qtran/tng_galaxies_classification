@@ -2,7 +2,7 @@ import os
 
 import numpy as np
 
-from scipy.spatial import cKDTree
+from scipy.spatial import KDTree
 
 import torch
 import torch.nn as nn
@@ -60,9 +60,9 @@ class TNGObjects:
 
             delattr(self,field)
             self.data_fields.remove(field)
-        self.data_fields.append(field_initial)
 
         setattr(self,field_initial,np.stack(vectorized_data,axis=1))
+        self.data_fields.append(field_initial)
 
 class Clusters(TNGObjects):
     default_vectorized_fields = [
@@ -86,10 +86,6 @@ class Galaxies(TNGObjects):
         'SubhaloSpin',
     ]
 
-    expand_directions = [
-        np.array([i,j,k]) for i in [-1,0,1] for j in [-1,0,1] for k in [-1,0,1]
-    ]
-
     def __init__(self,
                  data_file : str,
                  cluster_data : Clusters,
@@ -107,147 +103,188 @@ class Galaxies(TNGObjects):
         self._find_parent_clusters(cluster_data)
 
     def _find_parent_clusters(self,cluster_data):
-        expanded_GroupPos = []
-        for direction in self.expand_directions:
-            expanded_GroupPos.append(cluster_data.GroupPos + direction*self.box_size)
-        clusters_KDTree = cKDTree(np.concatenate(expanded_GroupPos,axis=0))
+        clusters_KDTree = KDTree(cluster_data.GroupPos,boxsize=self.box_size)
 
         self.SubhaloParentGroupDistance, self.SubhaloParentGroupIndex = clusters_KDTree.query(self.SubhaloPos)
-        self.SubhaloParentGroupIndex = self.SubhaloParentGroupIndex % cluster_data.GroupPos.shape[0]
+        self.SubhaloParentGroupIndex = self.SubhaloParentGroupIndex.astype(int)
         self.SubhaloParentGroupRadius = cluster_data.GroupRadius[self.SubhaloParentGroupIndex]
         self.SubhaloParentGroupMass = cluster_data.GroupMass[self.SubhaloParentGroupIndex]
         self.data_fields += ['SubhaloParentGroupDistance','SubhaloParentGroupIndex','SubhaloParentGroupRadius','SubhaloParentGroupMass']
 
 
-class DNNDataLoader:
+class GalaxyDataLoader:
     def __init__(self,
                  galaxy_data : Galaxies,
                  features_transform = None,
-                 boundaries : tuple = (0.5,2.0),
-                 subsample_field_galaxies : bool = True,
+                 boundaries : tuple = (1,1),
+                 trainval_ratio : float = 0.9,
                  train_ratio : float = 0.8,
-                 batch_size : int = 4096,
-                 num_workers : int = 8,
                  seed : int = 42):
-        self.features = features_transform(galaxy_data) if features_transform is not None else self._default_features_transform(galaxy_data)
-
         self.seed = seed
+        np.random.seed(seed)
         torch.manual_seed(self.seed)
 
-        self.lower_boundary, self.upper_boundary = boundaries
-        self.subsample_field_galaxies = subsample_field_galaxies
-        self._galaxies_masking(galaxy_data,subsample_field_galaxies)
+        self.galaxy_data = galaxy_data
+        self.features_transform = features_transform if features_transform is not None else self._default_features_transform
 
+        self.lower_boundary, self.upper_boundary = boundaries
+        self.cluster_galaxy_mask, self.field_galaxy_mask = self._galaxies_masking()
+
+        self.trainval_ratio = trainval_ratio
         self.train_ratio = train_ratio
 
-        self.batch_size = batch_size
-        self.num_workers = num_workers
+        self.train_galaxy_mask, self.val_galaxy_mask, self.test_galaxy_mask = self._get_train_val_test_masks()
 
-        self._get_data_loaders(galaxy_data)
-
-    def _default_features_transform(self,galaxy_data):
-        Gmag = galaxy_data.SubhaloGmag
-        Rmag = galaxy_data.SubhaloRmag
+    def _default_features_transform(self):
+        Gmag = self.galaxy_data.SubhaloGmag
+        Rmag = self.galaxy_data.SubhaloRmag
         Color = Gmag - Rmag # feature 1
 
-        Mass = galaxy_data.SubhaloMass
-        StellarMass = galaxy_data.SubhaloStellarMass
+        Mass = self.galaxy_data.SubhaloMass
+        StellarMass = self.galaxy_data.SubhaloStellarMass
         MassRatio = StellarMass/Mass # feature 2
 
-        SFR = galaxy_data.SubhaloSFR
+        SFR = self.galaxy_data.SubhaloSFR
         SSFR = SFR/StellarMass # feature 3
+        zero_SSFR_mask = SSFR <= 0
+        SSFR[zero_SSFR_mask] = 1e-16
 
-        GasMass = galaxy_data.SubhaloGasMass
+        GasMass = self.galaxy_data.SubhaloGasMass
         GasFrac = GasMass/(GasMass + StellarMass) # feature 4
 
-        GasMetallicity = galaxy_data.SubhaloGasMetallicity # feature 5
-        StarMetallicity = galaxy_data.SubhaloStarMetallicity # feature 6
+        GasMetallicity = self.galaxy_data.SubhaloGasMetallicity # feature 5
+        StarMetallicity = self.galaxy_data.SubhaloStarMetallicity # feature 6
 
-        return torch.tensor(
-            np.stack(
-                [
-                    Color,
-                    np.log10(MassRatio),
-                    np.log10(SSFR),
-                    GasFrac,
-                    GasMetallicity,
-                    StarMetallicity
-                ]
-            ,axis=1)
-        ,dtype=torch.float32)
+        return np.stack(
+            [
+                Color,
+                np.log10(MassRatio),
+                np.log10(SSFR),
+                GasFrac,
+                GasMetallicity,
+                StarMetallicity
+            ]
+        ,axis=1)
     
-    def _galaxies_masking(self,galaxy_data,subsample_field_galaxies):
-        self.cluster_galaxy_mask = torch.from_numpy(
-            galaxy_data.SubhaloParentGroupDistance < self.lower_boundary * galaxy_data.SubhaloParentGroupRadius
+    def _subsample_galaxies(self,galaxy_mask,subsampling_fraction):
+        subsample_mask = torch.rand(galaxy_mask.shape[0]) < subsampling_fraction
+
+        return torch.logical_and(
+            galaxy_mask,
+            subsample_mask
         )
-        N_cluster_galaxies = torch.sum(self.cluster_galaxy_mask)
+    
+    def _galaxies_masking(self):
+        cluster_galaxy_mask = torch.from_numpy(np.logical_and(
+            self.galaxy_data.SubhaloParentGroupDistance < self.lower_boundary * self.galaxy_data.SubhaloParentGroupRadius,
+            self.galaxy_data.SubhaloParentGroupDistance > 0
+        ))
+        N_cluster_galaxies = torch.sum(cluster_galaxy_mask)
+        print('Initial N_cluster_galaxies:',int(N_cluster_galaxies))
 
-        self.full_field_galaxy_mask = torch.from_numpy(
-            galaxy_data.SubhaloParentGroupDistance > self.upper_boundary * galaxy_data.SubhaloParentGroupRadius
+        field_galaxy_mask = torch.from_numpy(
+            self.galaxy_data.SubhaloParentGroupDistance > self.upper_boundary * self.galaxy_data.SubhaloParentGroupRadius
         )
-        N_field_galaxies = torch.sum(self.full_field_galaxy_mask)
+        N_field_galaxies = torch.sum(field_galaxy_mask)
+        print('Initial N_field_galaxies:',int(N_field_galaxies))
 
-        self.training_galaxy_mask = torch.logical_or(
-            self.cluster_galaxy_mask,
-            self.full_field_galaxy_mask
-        )
-
-        self.inference_galaxy_mask = torch.logical_not(self.training_galaxy_mask)
-
-        if subsample_field_galaxies:
-            subsample_mask = torch.rand(galaxy_data.SubhaloParentGroupDistance.shape[0]) < N_cluster_galaxies/N_field_galaxies
-            self.field_galaxy_mask = torch.logical_and(
-                self.full_field_galaxy_mask,
-                subsample_mask
-            )
+        if N_cluster_galaxies > N_field_galaxies:
+            cluster_galaxy_mask = self._subsample_galaxies(cluster_galaxy_mask,N_field_galaxies/N_cluster_galaxies)
         else:
-            self.field_galaxy_mask = self.full_field_galaxy_mask
+            field_galaxy_mask = self._subsample_galaxies(field_galaxy_mask,N_cluster_galaxies/N_field_galaxies)
 
-        print(torch.sum(self.field_galaxy_mask))
+        print('Subsampled N_cluster_galaxies:',int(torch.sum(cluster_galaxy_mask)))
+        print('Subsampled N_field_galaxies:',int(torch.sum(field_galaxy_mask)))
 
-    def _get_data_loaders(self,galaxy_data):
-        target = self.cluster_galaxy_mask.to(dtype=torch.int32)
-        target = target[self.training_galaxy_mask]
+        return cluster_galaxy_mask, field_galaxy_mask
 
-        train_val_dataset = TensorDataset(self.features[self.training_galaxy_mask],target)
-        inference_dataset = TensorDataset(
-            self.features[self.inference_galaxy_mask],
-            torch.tensor(galaxy_data.SubhaloParentGroupDistance[self.inference_galaxy_mask],dtype=torch.float32),
-            torch.tensor(galaxy_data.SubhaloParentGroupMass[self.inference_galaxy_mask],dtype=torch.float32),
-            torch.tensor(galaxy_data.SubhaloParentGroupRadius[self.inference_galaxy_mask],dtype=torch.float32),
+    def _get_train_val_test_masks(self):
+        # Get the masks for the training, validation and test sets (ensuring no cross-contamination between clusters)
+        all_cluster_indices = np.unique(self.galaxy_data.SubhaloParentGroupIndex)
+        N_cluster = len(all_cluster_indices)
+        
+        trainval_cluster_indices = np.random.choice(
+            all_cluster_indices,
+            size=int(N_cluster*self.trainval_ratio),
+            replace=False
+        )
+        test_cluster_indices = np.setdiff1d(all_cluster_indices,trainval_cluster_indices)
+        train_cluster_indices = np.random.choice(
+            trainval_cluster_indices,
+            size=int(len(trainval_cluster_indices)*self.train_ratio),
+            replace=False
+        )
+        val_cluster_indices = np.setdiff1d(trainval_cluster_indices,train_cluster_indices)
+
+        print('N_train_cluster:',len(train_cluster_indices))
+        print('N_val_cluster:',len(val_cluster_indices))
+        print('N_test_cluster:',len(test_cluster_indices))
+
+        trainval_galaxy_mask = np.logical_or(
+            self.cluster_galaxy_mask,
+            self.field_galaxy_mask
         )
 
-        N_data = train_val_dataset.tensors[0].shape[0]
-        N_train = int(N_data*self.train_ratio)
-        N_val = N_data - N_train
-        print('N_train:',N_train)
-        print('N_val:',N_val)
-
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_val_dataset,
-            [N_train,N_val]
+        train_galaxy_mask = np.logical_and(
+            np.isin(
+                self.galaxy_data.SubhaloParentGroupIndex,
+                train_cluster_indices
+            ),
+            trainval_galaxy_mask
+        )
+        val_galaxy_mask = np.logical_and(
+            np.isin(
+                self.galaxy_data.SubhaloParentGroupIndex,
+                val_cluster_indices
+            ),
+            trainval_galaxy_mask
+        )
+        test_galaxy_mask = np.isin(
+            self.galaxy_data.SubhaloParentGroupIndex,
+            test_cluster_indices
         )
 
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
+        return train_galaxy_mask, val_galaxy_mask, test_galaxy_mask
+    
+    def get_data_loaders(self,batch_size=2048,num_workers=8):
+        # Get features and targets
+        features = self.features_transform(self.galaxy_data)
+        targets = np.zeros(self.galaxy_data.SubhaloParentGroupIndex.shape[0])
+        targets[self.cluster_galaxy_mask] = 1
+
+        # To DataLoader
+        train_loader = DataLoader(
+            TensorDataset(
+                torch.from_numpy(features[self.train_galaxy_mask]),
+                torch.tensor(targets[self.train_galaxy_mask],dtype=torch.int32)
+            ),
+            batch_size=batch_size,
+            num_workers=num_workers,
             shuffle=True
         )
-
-        self.val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
+        val_loader = DataLoader(
+            TensorDataset(
+                torch.from_numpy(features[self.val_galaxy_mask]),
+                torch.tensor(targets[self.val_galaxy_mask],dtype=torch.int32)
+            ),
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=False
+        )
+        test_loader = DataLoader(
+            TensorDataset(
+                torch.from_numpy(features[self.test_galaxy_mask]),
+                torch.from_numpy(self.galaxy_data.SubhaloParentGroupDistance[self.test_galaxy_mask]),
+                torch.from_numpy(self.galaxy_data.SubhaloParentGroupRadius[self.test_galaxy_mask]),
+                torch.from_numpy(self.galaxy_data.SubhaloParentGroupMass[self.test_galaxy_mask]),
+            ),
+            batch_size=batch_size,
+            num_workers=num_workers,
             shuffle=False
         )
 
-        self.inference_loader = DataLoader(
-            inference_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=False
-        )
+        return train_loader, val_loader, test_loader
+    
 
 if __name__ == '__main__':
     from matplotlib import pyplot as plt
@@ -301,7 +338,7 @@ if __name__ == '__main__':
         plt.figure(figsize=(10,7))
         plt.plot(distance_bin_centers,galaxy_density)
         plt.xlabel(r'$r/R_{200}$')
-        plt.ylabel('Galaxy Density')
+        plt.ylabel('Galaxy Number Density')
         plt.xscale('log')
         plt.yscale('log')
         plt.xlim(0.1,100)
@@ -310,36 +347,36 @@ if __name__ == '__main__':
     data_path = '../../data/'
 
     metadata = Metadata(os.path.join(data_path,'metadata.pkl'))
+    print('Metadata:')
+    for field in metadata.data_fields:
+        print(f' {field}:')
+        print(getattr(metadata,field))
 
     clusters = Clusters(os.path.join(data_path,'group_data/reduced_data.0.h5'))
-    # print('Clusters:')
-    # for field in clusters.data_fields:
-    #     print(f' {field}:')
-    #     inspect_array(getattr(clusters,field),log=field == 'GroupMass')
+    print('Clusters:')
+    for field in clusters.data_fields:
+        print(f' {field}:')
+        inspect_array(getattr(clusters,field),log=field == 'GroupMass')
 
-    galaxies = Galaxies(os.path.join(data_path,'subhalo_data/reduced_data.0.h5'),clusters,metadata.BoxSize)
-    # print('Galaxies:')
-    # for field in galaxies.data_fields:
-    #     print(f' {field}:')
-    #     inspect_array(getattr(galaxies,field),log=field == 'SubhaloMass')
+    galaxies = Galaxies(os.path.join(data_path,'subhalo_data/reduced_data.0.h5'),clusters,metadata.BoxSize/metadata.HubbleParam)
+    print('Galaxies:')
+    for field in galaxies.data_fields:
+        print(f' {field}:')
+        inspect_array(getattr(galaxies,field),log=field in ['SubhaloMass','SubhaloStellarMass','SubhaloGasMass','SubhaloParentGroupMass'])
     
-    # print('Galaxy Cluster Distance Histogram:')
-    # show_galaxy_distribution(galaxies,distance_bins=np.linspace(0,100,1001))
+    print('Galaxy Cluster Distance Histogram:')
+    show_galaxy_distribution(galaxies,distance_bins=np.linspace(0,100,1001))
 
-    loader = DNNDataLoader(galaxies)
+    loader = GalaxyDataLoader(galaxies)
     # print('Features:')
     # for i,feature in enumerate(['Color','MassRatio','SSFR','GasFrac','GasMetallicity','StarMetallicity']):
     #     print(f' {feature}:')
     #     inspect_array(loader.features[:,i].cpu().numpy())
 
-    print('Cluster Galaxy Distances:')
-    inspect_array(galaxies.SubhaloParentGroupDistance[loader.cluster_galaxy_mask.cpu().numpy()]/galaxies.SubhaloParentGroupRadius[loader.cluster_galaxy_mask.cpu().numpy()])
+    # print('Galaxies Distances:')
+    # inspect_array(galaxies.SubhaloParentGroupDistance/galaxies.SubhaloParentGroupRadius)
 
-    print('Field Galaxy Distances:')
-    inspect_array(galaxies.SubhaloParentGroupDistance[loader.field_galaxy_mask.cpu().numpy()]/galaxies.SubhaloParentGroupRadius[loader.field_galaxy_mask.cpu().numpy()])
-
-    print('Inference Galaxy Parent Cluster Masses:')
-    inspect_array(galaxies.SubhaloParentGroupMass[loader.inference_galaxy_mask.cpu().numpy()])
+    train_loader, val_loader, test_loader = loader.get_data_loaders(batch_size=2048,num_workers=8)
 
     # print('Train DataLoader:')
     # for i, (X,Y) in enumerate(loader.train_loader):
