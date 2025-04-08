@@ -21,6 +21,7 @@ import data_loader
 from models import mlp
 from utils import train_utils
 
+import multiprocessing as mp
 mp.set_start_method('fork')
 
 ###########################################################################################

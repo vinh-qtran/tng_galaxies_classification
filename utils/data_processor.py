@@ -11,24 +11,12 @@ from tqdm import tqdm
 
 
 class FOFData:
-    '''
-    Processes data from Friends-of-Friends (FOF) files and saves it in HDF5 format.
-
-    Methods:
-        _get_fof_files(): Identifies and stores paths of all relevant FOF files.
-        _get_and_save_metadata(file): Extracts metadata from the first FOF file and saves it in a pickle file.
-        _get_field_data(data, field_label, sub_index): Extracts field data from an HDF5 dataset.
-        _mask_data(data, masking_field, masking_value): Masks data based on specified field and threshold.
-        _get_single_file_data(file): Extracts and processes data from a single FOF file.
-        _get_data(): Aggregates data from all FOF files.
-        _save_data(): Saves the processed data in HDF5 format.
-    '''
     def __init__(self, 
                  data_dir,
                  data_fields_info,
                  maskings,
                  save_file_dir,
-                 group_per_save_file,
+                 object_per_save_file,
                  metadata_fields=None):
         '''
         Initializes the FOFData object and processes the data.
@@ -38,7 +26,7 @@ class FOFData:
             data_fields_info (dict): Field mapping to extract specific data.
             maskings (list): List of field-value pairs for masking data.
             save_file_dir (str): Directory to save processed data.
-            group_per_save_file (int): Number of groups to save per output file.
+            object_per_save_file (int): Number of objects to save per output file.
             metadata_fields (list, optional): Metadata fields to extract.
         '''
         
@@ -48,6 +36,8 @@ class FOFData:
         self.metadata_fields = metadata_fields
         if self.metadata_fields is not None:
             self._get_and_save_metadata(self.fof_files[0])
+        else:
+            self.HubbleParam = 1
 
         self.data_fields_info = data_fields_info
         self.maskings = maskings
@@ -56,7 +46,7 @@ class FOFData:
         self.save_file_dir = save_file_dir
         if not os.path.exists(self.save_file_dir):
             os.makedirs(self.save_file_dir)
-        self.group_per_save_file = group_per_save_file
+        self.object_per_save_file = object_per_save_file
         self._save_data()
 
 
@@ -83,16 +73,17 @@ class FOFData:
         metadata = {}
         for field in self.metadata_fields:
             metadata[field] = file_data['Parameters'].attrs[field] if field in file_data['Parameters'].attrs else file_data['Header'].attrs[field]
+            setattr(self, field, metadata[field])
         
-        print('Metadata:')
-        for field in metadata:
-            print(f' {field}:',metadata[field])
+        # print('Metadata:')
+        # for field in metadata:
+        #     print(f' {field}:',metadata[field])
 
         with open('metadata.pkl', 'wb') as f:
             pickle.dump(metadata, f)
 
 
-    def _get_field_data(self,data,field_label,sub_index):
+    def _get_field_data(self,data,field_label,sub_index,h_scaling):
         '''
         Extracts data for a specific field from the HDF5 file.
 
@@ -100,13 +91,14 @@ class FOFData:
             data (h5py.Group): HDF5 group containing the data.
             field_label (str): Label of the field to extract.
             sub_index (int or None): Sub-index for multi-dimensional fields.
+            h_scaling (int): Scaling factor for Hubble parameter.
 
         Returns:
             np.ndarray: Extracted data.
         '''
         if sub_index is not None:
-            return np.array(data[field_label])[:,sub_index]
-        return np.array(data[field_label])
+            return np.array(data[field_label])[:,sub_index] * self.HubbleParam**h_scaling
+        return np.array(data[field_label]) * self.HubbleParam**h_scaling
     
     def _mask_data(self,data,masking_field,masking_value):
         '''
@@ -138,8 +130,8 @@ class FOFData:
         file_data = h5py.File(file, 'r')
         
         data = {}
-        for field,(field_label,sub_index) in self.data_fields_info.items():
-            data[field] = self._get_field_data(file_data,field_label,sub_index)
+        for field,(field_label,sub_index,h_scaling) in self.data_fields_info.items():
+            data[field] = self._get_field_data(file_data,field_label,sub_index,h_scaling)
 
         for masking_field,masking_value in self.maskings:
             data = self._mask_data(data,masking_field,masking_value)
@@ -170,8 +162,8 @@ class FOFData:
 
         Creates multiple files, each containing a subset of the data.
         '''
-        for i,start_index in tqdm(enumerate(range(0, len(self.data[self.maskings[0][0]]), self.group_per_save_file))):
-            end_index = min(start_index + self.group_per_save_file, len(self.data[self.maskings[0][0]]))
+        for i,start_index in tqdm(enumerate(range(0, len(self.data[self.maskings[0][0]]), self.object_per_save_file))):
+            end_index = min(start_index + self.object_per_save_file, len(self.data[self.maskings[0][0]]))
 
             df = pd.DataFrame({
                 field: self.data[field][start_index:end_index] for field in self.data_fields_info.keys()
@@ -192,7 +184,7 @@ class GroupData(FOFData):
         masking (list, optional): List of field-value pairs for masking data. 
                                   Default is [('GroupMass', 1e3)] to filter groups based on mass.
         save_file_dir (str, optional): Directory to save processed group data. Default is 'group_data'.
-        group_per_save_file (int, optional): Number of groups to save per output file. Default is 1,000,000.
+        object_per_save_file (int, optional): Number of groups to save per output file. Default is 1,000,000.
         metadata_fields (list, optional): Metadata fields to extract. Default is None.
 
     Attributes:
@@ -203,9 +195,9 @@ class GroupData(FOFData):
                  data_fields_info,
                  masking=[('GroupMass',1e3)],
                  save_file_dir='group_data',
-                 group_per_save_file=int(1e6),
+                 object_per_save_file=int(2e6),
                  metadata_fields=None):
-        super().__init__(data_dir, data_fields_info, masking, save_file_dir, group_per_save_file, metadata_fields)
+        super().__init__(data_dir, data_fields_info, masking, save_file_dir, object_per_save_file, metadata_fields)
         
 
 class SubHaloData(FOFData):
@@ -221,9 +213,8 @@ class SubHaloData(FOFData):
                                   Default is:
                                   - ('SubhaloFlag', 0): Excludes flagged subhalos.
                                   - ('SubhaloStellarMass', 1e-3): Filters subhalos based on stellar mass.
-                                  - ('SubhaloGasMass', 0): Ensures subhalos contain some gas.
         save_file_dir (str, optional): Directory to save processed subhalo data. Default is 'subhalo_data'.
-        group_per_save_file (int, optional): Number of subhalos to save per output file. Default is 1,000,000.
+        object_per_save_file (int, optional): Number of subhalos to save per output file. Default is 1,000,000.
         metadata_fields (list, optional): Metadata fields to extract. Default is None.
 
     Attributes:
@@ -232,34 +223,36 @@ class SubHaloData(FOFData):
     def __init__(self,
                  data_dir,
                  data_fields_info,
-                 masking=[('SubhaloFlag',0),('SubhaloStellarMass',1e-3),('SubhaloGasMass',0)],
+                 masking=[('SubhaloFlag',0),('SubhaloStellarMass',1e-3),],
                  save_file_dir='subhalo_data',
-                 group_per_save_file=int(1e6),
+                 object_per_save_file=int(2e6),
                  metadata_fields=None):
-        super().__init__(data_dir, data_fields_info, masking, save_file_dir, group_per_save_file, metadata_fields)
+        super().__init__(data_dir, data_fields_info, masking, save_file_dir, object_per_save_file, metadata_fields)
 
 
 if __name__ == '__main__':
-    def inspect_array(array,log=False):
+    def inspect_array(array,log=False,exclude_nan=False):
         '''
         Helper function to inspect the array.
         '''
         print(' Shape:', array.shape)
+
         array = np.log10(array) if log else array
-        print(' Min:', np.nanmin(array))
-        print(' Max:', np.nanmax(array))
-        print(' Mean:', np.nanmean(array))
-        print(' Std:', np.nanstd(array))
+
+        print(' Min:', np.nanmin(array) if exclude_nan else np.min(array))
+        print(' Max:', np.nanmax(array) if exclude_nan else np.max(array))
+        print(' Mean:', np.nanmean(array) if exclude_nan else np.mean(array))
+        print(' Std:', np.nanstd(array) if exclude_nan else np.std(array))
 
     # Group data analysis
     group_data = GroupData(
         data_dir='groups_099',
         data_fields_info={
-            'GroupMass': ('Group/Group_M_Mean200',None),
-            'GroupPos.x': ('Group/GroupPos',0),
-            'GroupPos.y': ('Group/GroupPos',1),
-            'GroupPos.z': ('Group/GroupPos',2),
-            'GroupRadius' : ('Group/Group_R_Mean200',None),
+            'GroupMass': ('Group/Group_M_Mean200',None,-1),
+            'GroupPos.x': ('Group/GroupPos',0,-1),
+            'GroupPos.y': ('Group/GroupPos',1,-1),
+            'GroupPos.z': ('Group/GroupPos',2,-1),
+            'GroupRadius' : ('Group/Group_R_Mean200',None,-1),
         },
         metadata_fields=['UnitLength_in_cm','UnitMass_in_g','UnitVelocity_in_cm_per_s',
                          'BoxSize',
@@ -278,47 +271,47 @@ if __name__ == '__main__':
     subhalo_data = SubHaloData(
         data_dir='groups_099',
         data_fields_info={
-            'SubhaloFlag': ('Subhalo/SubhaloFlag',None),
+            'SubhaloFlag': ('Subhalo/SubhaloFlag',None,0),
 
-            'SubhaloMass': ('Subhalo/SubhaloMass',None),
-            'SubhaloGasMass': ('Subhalo/SubhaloMassInRadType',0),
-            'SubhaloStellarMass': ('Subhalo/SubhaloMassInRadType',4),
+            'SubhaloMass': ('Subhalo/SubhaloMass',None,-1),
+            'SubhaloGasMass': ('Subhalo/SubhaloMassInRadType',0,-1),
+            'SubhaloStellarMass': ('Subhalo/SubhaloMassInRadType',4,-1),
 
-            'SubhaloGasMetallicity': ('Subhalo/SubhaloGasMetallicity',None),
-            'SubhaloStarMetallicity': ('Subhalo/SubhaloStarMetallicity',None),
+            'SubhaloGasMetallicity': ('Subhalo/SubhaloGasMetallicity',None,0),
+            'SubhaloStarMetallicity': ('Subhalo/SubhaloStarMetallicity',None,0),
 
-            'SubhaloSFR': ('Subhalo/SubhaloSFR',None),
+            'SubhaloSFR': ('Subhalo/SubhaloSFR',None,0),
 
-            'SubhaloPos.x': ('Subhalo/SubhaloPos',0),
-            'SubhaloPos.y': ('Subhalo/SubhaloPos',1),
-            'SubhaloPos.z': ('Subhalo/SubhaloPos',2),
+            'SubhaloPos.x': ('Subhalo/SubhaloPos',0,-1),
+            'SubhaloPos.y': ('Subhalo/SubhaloPos',1,-1),
+            'SubhaloPos.z': ('Subhalo/SubhaloPos',2,-1),
 
-            'SubhaloVel.x': ('Subhalo/SubhaloVel',0),
-            'SubhaloVel.y': ('Subhalo/SubhaloVel',1),
-            'SubhaloVel.z': ('Subhalo/SubhaloVel',2),
+            'SubhaloVel.x': ('Subhalo/SubhaloVel',0,0),
+            'SubhaloVel.y': ('Subhalo/SubhaloVel',1,0),
+            'SubhaloVel.z': ('Subhalo/SubhaloVel',2,0),
 
-            'SubhaloSpin.x': ('Subhalo/SubhaloSpin',0),
-            'SubhaloSpin.y': ('Subhalo/SubhaloSpin',1),
-            'SubhaloSpin.z': ('Subhalo/SubhaloSpin',2),
+            'SubhaloSpin.x': ('Subhalo/SubhaloSpin',0,-1),
+            'SubhaloSpin.y': ('Subhalo/SubhaloSpin',1,-1),
+            'SubhaloSpin.z': ('Subhalo/SubhaloSpin',2,-1),
 
-            'SubhaloVelDisp': ('Subhalo/SubhaloVelDisp',None),
-            'SubhaloVmax': ('Subhalo/SubhaloVmax',None),
+            'SubhaloVelDisp': ('Subhalo/SubhaloVelDisp',None,0),
+            'SubhaloVmax': ('Subhalo/SubhaloVmax',None,0),
 
-            'SubhaloUMag': ('Subhalo/SubhaloStellarPhotometrics',0),
-            'SubhaloBMag': ('Subhalo/SubhaloStellarPhotometrics',1),
-            'SubhaloVMag': ('Subhalo/SubhaloStellarPhotometrics',2),
-            'SubhaloKMag': ('Subhalo/SubhaloStellarPhotometrics',3),
-            'SubhaloGmag': ('Subhalo/SubhaloStellarPhotometrics',4),
-            'SubhaloRmag': ('Subhalo/SubhaloStellarPhotometrics',5),
-            'SubhaloImag': ('Subhalo/SubhaloStellarPhotometrics',6),
-            'SubhaloZmag': ('Subhalo/SubhaloStellarPhotometrics',7),
+            'SubhaloUMag': ('Subhalo/SubhaloStellarPhotometrics',0,0),
+            'SubhaloBMag': ('Subhalo/SubhaloStellarPhotometrics',1,0),
+            'SubhaloVMag': ('Subhalo/SubhaloStellarPhotometrics',2,0),
+            'SubhaloKMag': ('Subhalo/SubhaloStellarPhotometrics',3,0),
+            'SubhaloGmag': ('Subhalo/SubhaloStellarPhotometrics',4,0),
+            'SubhaloRmag': ('Subhalo/SubhaloStellarPhotometrics',5,0),
+            'SubhaloImag': ('Subhalo/SubhaloStellarPhotometrics',6,0),
+            'SubhaloZmag': ('Subhalo/SubhaloStellarPhotometrics',7,0),
         },
+        metadata_fields=['UnitLength_in_cm','UnitMass_in_g','UnitVelocity_in_cm_per_s',
+                         'BoxSize',
+                         'HubbleParam','Omega0','OmegaLambda','Redshift','Time']
     )
 
     print('Subhalo Data:')
     for field in subhalo_data.data:
         print(field)
-        if field in ['SubhaloMass','SubhaloGasMass','SubhaloStellarMass']:
-            inspect_array(subhalo_data.data[field],log=True)
-        else:
-            inspect_array(subhalo_data.data[field])
+        inspect_array(subhalo_data.data[field],log=field in ['SubhaloMass','SubhaloGasMass','SubhaloStellarMass'])
